@@ -36,7 +36,7 @@ This project demonstrates how to build a **domain‑specific RAG assistant** tha
 - Returns **explicit citations** so every claim is traceable to a source page and article.
 - Refuses to answer when the corpus does not contain the relevant information.
 
-It was built as part of a Master's in Data Science & Analytics (EPITA Paris) to demonstrate production ML engineering skills for internship applications.
+It was built to demonstrate production ML engineering skills for internship applications.
 
 ---
 
