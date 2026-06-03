@@ -1,0 +1,6 @@
+ragas==0.2.6
+datasets==3.6.0
+pandas==2.2.3
+langchain-groq==1.0.0
+langchain-huggingface==0.1.2
+requests==2.32.3
