@@ -47,3 +47,13 @@ services:
     depends_on:
       qdrant:
         condition: service_started
+  frontend:
+    build: ./frontend
+    ports:
+      - "7860:7860"
+    env_file:
+      - .env
+    networks:
+      - rag_network
+    depends_on:
+      - generation
