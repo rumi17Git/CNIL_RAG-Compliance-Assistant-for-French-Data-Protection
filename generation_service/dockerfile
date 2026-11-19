@@ -1,6 +1,8 @@
+# Built from the project root (see docker-compose.yml) so rag_core can be copied in
 FROM python:3.10.16-slim-bullseye
 WORKDIR /app
-COPY requirements.txt .
+COPY generation_service/requirements.txt .
 RUN pip install --no-cache-dir --default-timeout=1000 --retries=5 -r requirements.txt
-COPY . .
+COPY rag_core ./rag_core
+COPY generation_service/ .
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8002"]

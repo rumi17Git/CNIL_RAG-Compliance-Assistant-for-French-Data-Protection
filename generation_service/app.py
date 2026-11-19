@@ -1,112 +1,102 @@
+"""Generation service: answers a question with one of the RAG pipelines in rag_core."""
+from contextlib import asynccontextmanager
+from typing import List, Optional
+
+import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer, CrossEncoder
-import os
-import requests
-from typing import List, Optional
-from groq import Groq
+from qdrant_client import QdrantClient
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
-app = FastAPI()
+from rag_core.config import Settings
+from rag_core.embeddings import E5Embeddings
+from rag_core.llm import make_json_llm, make_llm
+from rag_core.pipelines import PIPELINES, Components, build_pipelines
+from rag_core.store import ChunkStore
 
-# Configuration
-qdrant_host = os.getenv("QDRANT_HOST", "qdrant")
-qdrant_port = int(os.getenv("QDRANT_PORT", 6333))
-collection_name = os.getenv("COLLECTION_NAME", "cnil_docs")
-model_name = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-base")
-groq_api_key = os.getenv("GROQ_API_KEY")
-if not groq_api_key:
-    raise ValueError("GROQ_API_KEY environment variable not set")
+settings = Settings()
+state = {}
 
-# Load embedding model (CPU)
-embedder = SentenceTransformer(model_name, device="cpu")
 
-# Load cross‑encoder reranker (small, fast, multilingual)
-reranker = CrossEncoder('cross-encoder/mmarco-mMiniLMv2-L12-H384-v1', device="cpu")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load models once at startup (CPU)
+    embedder = SentenceTransformer(settings.embedding_model, device="cpu")
+    reranker = CrossEncoder(settings.reranker_model, device="cpu")
+    client = QdrantClient(host=settings.qdrant_host, port=settings.qdrant_port)
+    store = ChunkStore(client, settings.collection_name, E5Embeddings(embedder))
+    state["store"] = store
+    state["pipelines"] = build_pipelines(Components(settings, store, reranker, make_llm(settings),
+                                                    json_llm=make_json_llm(settings)))
+    yield
 
-# Groq client
-groq_client = Groq(api_key=groq_api_key)
+
+app = FastAPI(lifespan=lifespan)
+
 
 class QueryRequest(BaseModel):
     question: str
-    top_k: int = 5
+    top_k: int = 6
+    pipeline: Optional[str] = None  # v0, v1, v2, v2-faiss, v3; default from DEFAULT_PIPELINE
+
 
 class Citation(BaseModel):
     text: str
     source_document: str
     page_number: int
-    article_id: Optional[str]
+    page_end: Optional[int] = None
+    article_id: Optional[str] = None
+
 
 class QueryResponse(BaseModel):
     answer: str
+    refused: bool
+    pipeline: str
+    latency_ms: int
+    llm_calls: int = 1
+    trace: List[str] = []   # the agent's steps (v3); empty for the other pipelines
     citations: List[Citation]
+
 
 @app.get("/ping")
 def ping():
-    return {"message": "Generation service is alive"}
+    return {"message": "Generation service is alive (using local Ollama)"}
 
+
+@app.get("/pipelines")
+def pipelines():
+    return {"available": PIPELINES, "default": settings.default_pipeline}
+
+
+# A plain "def" endpoint runs in a worker thread, so a slow answer (a local LLM can
+# take a minute) doesn't block /ping and make the health check fail.
 @app.post("/query", response_model=QueryResponse)
-async def query(req: QueryRequest):
-    # 1. Embed question with "query:" prefix
-    query_vector = embedder.encode(f"query: {req.question}").tolist()
+def query(req: QueryRequest):
+    name = req.pipeline or settings.default_pipeline
+    if name not in state["pipelines"]:
+        raise HTTPException(status_code=400, detail=f"Unknown pipeline '{name}'. Choose from {PIPELINES}.")
+    try:
+        out = state["pipelines"][name](req.question, req.top_k)
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Ollama request error: {e}")
+    except Exception as e:  # e.g. Ollama unreachable through LangChain, Qdrant down
+        raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
 
-    # 2. Retrieve more candidates than needed (for reranking)
-    initial_k = max(req.top_k * 3, 15)  # fetch at least 15
-    qdrant_url = f"http://{qdrant_host}:{qdrant_port}/collections/{collection_name}/points/search"
-    search_payload = {
-        "vector": query_vector,
-        "limit": initial_k,
-        "with_payload": True
-    }
-    response = requests.post(qdrant_url, json=search_payload)
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Qdrant search failed")
-    search_result = response.json()["result"]
+    if not out["docs"]:
+        raise HTTPException(status_code=404, detail="No relevant documents found. Run the ingestion first.")
+    # An empty reply is a failure, not a refusal: counting it as a refusal would
+    # inflate the refusal score in the evaluation.
+    if not out["raw"].strip():
+        raise HTTPException(status_code=502, detail="Ollama returned an empty answer")
 
-    if not search_result:
-        raise HTTPException(status_code=404, detail="No relevant documents found.")
-
-    # 3. Rerank using cross‑encoder
-    pairs = [[req.question, point["payload"]["text_content"]] for point in search_result]
-    scores = reranker.predict(pairs)
-    # Combine and sort by score (higher is better)
-    scored = sorted(zip(search_result, scores), key=lambda x: x[1], reverse=True)
-    final_points = [point for point, _ in scored[:req.top_k]]
-
-    # 4. Build context and citations from reranked results
-    contexts = []
-    citations = []
-    for point in final_points:
-        payload = point["payload"]
-        chunk_text = payload.get("text_content", "")
-        contexts.append(chunk_text)
-        citations.append(Citation(
-            text=chunk_text,
-            source_document=payload.get("source_document", "unknown"),
-            page_number=payload.get("page_number", 0),
-            article_id=payload.get("article_id")
-        ))
-
-    context_str = "\n\n---\n\n".join(contexts)
-
-    # 5. French strict grounding prompt
-    prompt = f"""Tu es un expert en conformité CNIL (Commission Nationale de l'Informatique et des Libertés). 
-Réponds UNIQUEMENT à partir du contexte ci-dessous. Si la réponse ne s'y trouve pas, dis : 
-"Je ne trouve pas cette information dans les documents fournis."
-
-CONTEXTE :
-{context_str}
-
-QUESTION : {req.question}
-
-RÉPONSE (en français, avec citations explicites des articles si disponibles) :"""
-
-    # 6. Call Groq (LLaMA 3.1 8B)
-    completion = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=500
-    )
-    answer = completion.choices[0].message.content
-
-    return QueryResponse(answer=answer, citations=citations)
+    citations = [
+        Citation(text=d.page_content,
+                 source_document=d.metadata.get("source_document", "unknown"),
+                 page_number=d.metadata.get("page_number", 0),
+                 page_end=d.metadata.get("page_end"),
+                 article_id=d.metadata.get("article_id"))
+        for d in out["docs"]
+    ]
+    return QueryResponse(answer=out["answer"], refused=out["refused"], pipeline=name,
+                         latency_ms=out["latency_ms"], llm_calls=out.get("llm_calls", 1),
+                         trace=out.get("trace", []), citations=citations)

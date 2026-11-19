@@ -1,135 +1,102 @@
-from fastapi import FastAPI, UploadFile, File
+import os
+import uuid
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
-import os
-import io
-import re
-import uuid
-from PyPDF2 import PdfReader
 
-app = FastAPI()
+from chunking import parse_pdf
 
 # ---- Configuration ----
 qdrant_host = os.getenv("QDRANT_HOST", "qdrant")
 qdrant_port = int(os.getenv("QDRANT_PORT", 6333))
 collection_name = os.getenv("COLLECTION_NAME", "cnil_docs")
 model_name = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-base")
+
 embedder = SentenceTransformer(model_name, device="cpu")
-embedding_dim = 768
+embedding_dim = embedder.get_sentence_embedding_dimension()
+max_tokens = embedder.max_seq_length  # 512 for the E5 models
 
 qdrant = QdrantClient(host=qdrant_host, port=qdrant_port)
 
-# ---- Helper: clean text (remove page headers/footers, noise) ----
-def _clean_text(text: str) -> str:
-    # Remove leading page numbers (e.g., "61\n" or "55 ")
-    text = re.sub(r"^\d{1,3}\n", "", text)
-    # Remove patterns like "61FICHES MESURES" or "55FICHE 23"
-    text = re.sub(r"\d{1,3}FICHE[S]?\s*(MESURES)?", "", text)
-    # Remove soft hyphens (Unicode \xad)
-    text = re.sub(r"\xad", "", text)
-    # Normalize multiple spaces and line breaks
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\s*\n\s*\n\s*", "\n\n", text)
-    return text.strip()
+# Fixed namespace so the same chunk always gets the same id
+POINT_NAMESPACE = uuid.UUID("6f1c2a4e-3b7d-4c9a-8e21-5d0f9b7a1c33")
 
-# ---- Helper: parse PDF into chunks with cleaning ----
-def parse_pdf(file_bytes: bytes, filename: str):
-    reader = PdfReader(io.BytesIO(file_bytes))
-    chunks = []
-    article_pattern = r"(Article\s+[\d\-–]+)"
-    chunk_idx = 0
 
-    for page_num, page in enumerate(reader.pages, start=1):
-        raw_text = page.extract_text()
-        if not raw_text:
-            continue
-        # Clean the whole page text first
-        text = _clean_text(raw_text)
-        if not text:
-            continue
+def point_id(source_document: str, chunk_index: int) -> str:
+    return str(uuid.uuid5(POINT_NAMESPACE, f"{source_document}:{chunk_index}"))
 
-        parts = re.split(article_pattern, text)
-        if len(parts) == 1:
-            chunks.append({
-                "source_document": filename,
-                "page_number": page_num,
-                "article_id": None,
-                "chunk_index": chunk_idx,
-                "text_content": text
-            })
-            chunk_idx += 1
-        else:
-            for i in range(1, len(parts), 2):
-                article_title = _clean_text(parts[i])
-                article_content = _clean_text(parts[i+1]) if i+1 < len(parts) else ""
-                full_chunk = f"{article_title}\n{article_content}".strip()
-                if full_chunk:
-                    chunks.append({
-                        "source_document": filename,
-                        "page_number": page_num,
-                        "article_id": article_title,
-                        "chunk_index": chunk_idx,
-                        "text_content": full_chunk
-                    })
-                    chunk_idx += 1
-    return chunks
 
-# ---- Qdrant init ----
-@app.on_event("startup")
-def init_qdrant():
-    try:
-        qdrant.get_collection(collection_name)
-        print(f"Collection '{collection_name}' already exists.")
-    except Exception:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not qdrant.collection_exists(collection_name):
         print(f"Creating collection '{collection_name}' with dimension {embedding_dim}...")
         qdrant.create_collection(
             collection_name=collection_name,
-            vectors_config=models.VectorParams(size=embedding_dim, distance=models.Distance.COSINE)
+            vectors_config=models.VectorParams(size=embedding_dim, distance=models.Distance.COSINE),
         )
+    else:
+        size = qdrant.get_collection(collection_name).config.params.vectors.size
+        if size != embedding_dim:
+            raise RuntimeError(
+                f"Collection '{collection_name}' has vectors of size {size}, but {model_name} "
+                f"produces {embedding_dim}. Run 'make clean' or use another COLLECTION_NAME."
+            )
+        print(f"Collection '{collection_name}' already exists.")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/ping")
 def ping():
     return {"message": "Ingestion service is alive"}
 
+
 @app.post("/ingest")
 async def ingest_pdf(file: UploadFile = File(...)):
-    if not file.filename.endswith('.pdf'):
-        return {"error": "Only PDF files are accepted"}
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
 
     contents = await file.read()
     chunks = parse_pdf(contents, file.filename)
-
     if not chunks:
-        return {"filename": file.filename, "error": "No text extracted"}
+        raise HTTPException(status_code=422, detail="No text extracted from the PDF")
 
-    # Prepare texts for embedding
-    texts = [chunk["text_content"] for chunk in chunks]
-    prefixed_texts = [f"passage: {t}" for t in texts]
+    prefixed_texts = [f"passage: {c['text_content']}" for c in chunks]
 
-    # Encode
-    embeddings = embedder.encode(prefixed_texts, batch_size=4, show_progress_bar=True)
+    # Check that every chunk fits in the model's window (anything longer is cut off)
+    token_counts = [len(embedder.tokenizer(t)["input_ids"]) for t in prefixed_texts]
+    over_limit = [i for i, n in enumerate(token_counts) if n > max_tokens]
 
-    # Upsert to Qdrant
-    points = []
-    for idx, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-        points.append(
-            models.PointStruct(
-                id=str(uuid.uuid4()),
-                vector=emb.tolist(),
-                payload={
-                    "source_document": chunk["source_document"],
-                    "page_number": chunk["page_number"],
-                    "article_id": chunk["article_id"],
-                    "chunk_index": chunk["chunk_index"],
-                    "text_content": chunk["text_content"]   # already cleaned
-                }
-            )
+    embeddings = embedder.encode(prefixed_texts, batch_size=8, show_progress_bar=True)
+
+    # Replace this document's old chunks, so re-ingesting never leaves duplicates
+    # or leftovers from an older chunking
+    qdrant.delete(
+        collection_name=collection_name,
+        points_selector=models.FilterSelector(filter=models.Filter(must=[
+            models.FieldCondition(key="source_document", match=models.MatchValue(value=file.filename))
+        ])),
+    )
+    points = [
+        models.PointStruct(
+            id=point_id(chunk["source_document"], chunk["chunk_index"]),
+            vector=emb.tolist(),
+            payload=chunk,
         )
+        for chunk, emb in zip(chunks, embeddings)
+    ]
     qdrant.upsert(collection_name=collection_name, points=points)
 
     return {
         "filename": file.filename,
         "chunks_created": len(chunks),
-        "status": "embedded and stored in Qdrant"
+        "sections": len({c["article_id"] for c in chunks}),
+        "max_tokens_per_chunk": max(token_counts),
+        "chunks_over_token_limit": len(over_limit),
+        "status": "embedded and stored in Qdrant",
     }

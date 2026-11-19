@@ -1,4 +1,4 @@
-.PHONY: help start stop restart clean logs status ingest query test
+.PHONY: help start stop restart clean logs status ingest query test eval
 
 help:
 	@echo "Available targets:"
@@ -9,8 +9,9 @@ help:
 	@echo "  logs                - Tail logs of all services"
 	@echo "  status              - Show container status"
 	@echo "  ingest              - Upload the CNIL PDF"
-	@echo "  query Q='question'  - Ask a question (e.g., make query Q='Que dit l'article 32 ?')"
-	@echo "  test                - Run the full test suite"
+	@echo "  query Q='question'  - Ask a question; add P=v2 to pick a pipeline (v0, v1, v2, v2-faiss)"
+	@echo "  test                - Run the sample queries"
+	@echo "  eval                - Run the 40-question benchmark (needs evaluation/requirements.txt)"
 
 start:
 	docker compose up -d
@@ -24,7 +25,6 @@ restart: stop start
 
 clean:
 	docker compose down -v
-	docker system prune -f --volumes
 
 logs:
 	docker compose logs -f
@@ -48,9 +48,12 @@ query:
 	@echo "Answer:"
 	@curl -s -X POST http://localhost:8002/query \
 	  -H "Content-Type: application/json" \
-	  -d "{\"question\": \"$(Q)\", \"top_k\": 3}" \
+	  -d "{\"question\": \"$(Q)\", \"top_k\": 6, \"pipeline\": \"$(or $(P),v0)\"}" \
 	  | jq -r '.answer'
 	@echo ""
 
 test:
 	@./test_queries.sh
+
+eval:
+	cd evaluation && python evaluation.py
