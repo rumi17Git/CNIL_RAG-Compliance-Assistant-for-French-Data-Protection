@@ -2,6 +2,7 @@
 
 # Virtual environments
 venv/
+.venv/
 env/
 eval_env/
 
@@ -9,12 +10,16 @@ eval_env/
 qdrant_data/
 hf_cache/
 
-# Python cache
+# Python and tool caches
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
 
-# Evaluation results
+# Evaluation: keep raw answers and scores, skip temporary files
 evaluation_results.csv
+evaluation/results/checkpoint_*.csv
+evaluation/results/*.log
 
 # Secrets
 .env

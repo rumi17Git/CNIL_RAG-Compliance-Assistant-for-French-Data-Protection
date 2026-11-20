@@ -1,0 +1,22 @@
+# Run the unit tests locally: pip install -r requirements-dev.txt && pytest -q
+# Pins match generation_service/ and ingestion_service/ requirements, except:
+# - langchain-text-splitters: 1.x needs langchain-core 1.x, so tests use 0.3.x.
+# - fastapi matches generation_service (0.115.14); ingestion_service still pins
+#   0.104.1, which needs anyio<4 and so can't share a venv with the evaluation tools.
+# - httpx 0.28.1 instead of generation_service's 0.27.0: it's the version already in
+#   .venv, and the tests only use it through FastAPI's TestClient.
+# No torch / sentence-transformers needed: the tests use fake models.
+pytest==9.2.0
+fastapi==0.115.14
+httpx==0.28.1
+numpy
+ruff==0.17.6
+langchain-core==0.3.86
+langchain-community==0.3.27
+langchain-ollama==0.3.10
+langchain-text-splitters==0.3.11
+langgraph==0.6.11
+rank-bm25==0.2.2
+faiss-cpu==1.16.0
+qdrant-client==1.18.0
+PyPDF2==3.0.1

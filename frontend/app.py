@@ -1,11 +1,13 @@
+import os
+
 import streamlit as st
 import requests
 
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
-API_URL = "http://localhost:8002/query"
-DEFAULT_TOP_K = 5
+API_URL = os.getenv("API_URL", "http://generation:8002/query")
+DEFAULT_TOP_K = 6
 
 st.set_page_config(
     page_title="Assistant CNIL",
@@ -88,14 +90,23 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### ⚙️ Paramètres")
     top_k = st.slider("Nombre de sources consultées", min_value=1, max_value=10, value=DEFAULT_TOP_K)
+    pipeline = st.selectbox(
+        "Méthode de recherche",
+        ["v0", "v1", "v2", "v2-faiss", "v3"],
+        index=0,
+        help="v0 : recherche vectorielle (code d'origine) · v1 : même méthode avec LangChain · "
+             "v2 : hybride mots-clés (BM25) + vecteurs · v2-faiss : hybride avec un index FAISS · "
+             "v3 : agent LangGraph (reformule, vérifie, lit le contexte autour)",
+    )
 
     st.markdown("---")
     st.markdown("### 📊 Fiabilité du système")
+    # Update these after each benchmark run (evaluation/results/)
     col1, col2 = st.columns(2)
-    col1.metric("Précision", "1.00")
-    col2.metric("Fidélité", "1.00")
-    st.metric("Pertinence des réponses", "0.92")
-    st.caption("Scores RAGAS évalués sur le corpus CNIL.")
+    col1.metric("Précision du contexte", "0.97")
+    col2.metric("Fidélité", "0.75")
+    st.metric("Refus corrects (hors corpus)", "100 %")
+    st.caption("Scores RAGAS sur un benchmark de 40 questions (version à découpage par page).")
 
     st.markdown("---")
     if st.button("🗑️ Effacer la conversation", use_container_width=True):
@@ -168,8 +179,8 @@ if question:
     with st.chat_message("assistant", avatar="📘"):
         with st.spinner("Recherche dans le guide CNIL..."):
             try:
-                payload = {"question": question, "top_k": top_k}
-                resp = requests.post(API_URL, json=payload, timeout=60)
+                payload = {"question": question, "top_k": top_k, "pipeline": pipeline}
+                resp = requests.post(API_URL, json=payload, timeout=1200)
 
                 if resp.status_code == 200:
                     data = resp.json()
@@ -177,6 +188,12 @@ if question:
                     citations = data.get("citations", [])
 
                     st.markdown(answer)
+                    st.caption(f"Méthode {data.get('pipeline', pipeline)} · {data.get('latency_ms', 0) / 1000:.1f} s"
+                               f" · {data.get('llm_calls', 1)} appel(s) au modèle")
+                    if data.get("trace"):
+                        with st.expander("Raisonnement de l'agent"):
+                            for step in data["trace"]:
+                                st.markdown(f"- {step}")
                     render_citations(citations)
 
                     st.session_state.history.append(

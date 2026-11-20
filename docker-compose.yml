@@ -16,7 +16,12 @@ services:
       - "6334:6334"
     networks:
       - rag_network
-    # No healthcheck – we'll rely on service start order + retries in ingestion
+    healthcheck:
+      # The Qdrant image has no curl, so open a TCP connection with bash instead
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   ingestion:
     build: ./ingestion_service
@@ -30,12 +35,18 @@ services:
       - rag_network
     depends_on:
       qdrant:
-        condition: service_started   # just wait for container start
-    # Add a small startup delay (optional, but helps)
-    # command: sh -c "sleep 5 && uvicorn app:app --host 0.0.0.0 --port 8001"
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 600s  # first start downloads the embedding model
 
   generation:
-    build: ./generation_service
+    build:
+      context: .                              # project root, so rag_core is included
+      dockerfile: generation_service/dockerfile
     ports:
       - "8002:8002"
     env_file:
@@ -44,16 +55,27 @@ services:
       - hf_cache:/root/.cache/huggingface
     networks:
       - rag_network
+    extra_hosts:
+      # Lets the container reach Ollama running on your machine (needed on Linux)
+      - "host.docker.internal:host-gateway"
     depends_on:
       qdrant:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 600s  # first start downloads the embedding model and reranker
+
   frontend:
     build: ./frontend
     ports:
       - "7860:7860"
-    env_file:
-      - .env
+    environment:
+      - API_URL=http://generation:8002/query
     networks:
       - rag_network
     depends_on:
-      - generation
+      generation:
+        condition: service_healthy

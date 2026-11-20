@@ -1,6 +1,14 @@
 ragas==0.2.6
 datasets==3.6.0
 pandas==2.2.3
-langchain-groq==1.0.0
+langchain==0.3.30
+langchain-core==0.3.86
+langchain-community==0.3.27
+langchain-openai==0.3.35
 langchain-huggingface==0.1.2
+sentence-transformers==2.7.0
 requests==2.32.3
+langchain-groq==0.3.8
+langchain-mistralai==0.2.12
+python-dotenv==1.0.1
+langchain-anthropic==0.3.22

@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint and tests (Python 3.10)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # No PyTorch: the tests replace the embedding model and reranker with fakes
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Check that PyTorch was not installed
+        run: |
+          if python -c "import torch" 2>/dev/null; then
+            echo "::error::PyTorch was installed by requirements-dev.txt; the tests should not need it"
+            exit 1
+          fi
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Pytest
+        run: pytest -q
+
+  docker:
+    name: Build ${{ matrix.image }} image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ingestion
+            context: ingestion_service
+            dockerfile: ingestion_service/dockerfile
+          - image: generation
+            context: .                      # project root, so rag_core is included
+            dockerfile: generation_service/dockerfile
+          - image: frontend
+            context: frontend
+            dockerfile: frontend/dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: cnil-rag-${{ matrix.image }}:ci
