@@ -131,7 +131,10 @@ def build_agent(c, hybrid_retrieve, json_llm):
 
     def plan(st: AgentState):
         reply = (PLAN_PROMPT | json_llm).invoke({"question": st["question"]})
-        subs = [q.strip() for q in parse_json(reply, "requetes", []) if isinstance(q, str) and q.strip()][:2]
+        requetes = parse_json(reply, "requetes", [])
+        if not isinstance(requetes, list):  # a string or object would be iterated char by char / by key
+            requetes = []
+        subs = [q.strip() for q in requetes if isinstance(q, str) and q.strip()][:2]
         # The original question is always searched; sub-questions are added, never
         # substituted, so a poor split cannot lose the right passages.
         queries = [st["question"]] + [q for q in subs if q.lower() != st["question"].strip().lower()]
